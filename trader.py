@@ -1,36 +1,32 @@
-# trader.py - Final Version with Correct DB Connection Handling
 import ccxt
 import sqlite3
 import time
 from datetime import datetime, timezone
 import config
+from telegram_logger import send_message # <-- Import our new function
 
 # --- Global Variables ---
 DB_NAME = "signals.db"
-POLL_INTERVAL = 10  # Synced with the listener's interval
+POLL_INTERVAL = 10
 MAX_SIGNAL_AGE_MINUTES = 5
 active_positions = {}
 
-# --- Helper Function for Logging ---
+# --- Helper Function for Console Logging ---
 def log(message):
-    """Prints a message with a standard UTC timestamp."""
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp} UTC] {message}")
 
 def get_new_signals(conn):
-    """Fetches new signals from the database."""
     cursor = conn.cursor()
     cursor.execute("SELECT id, symbol, side, price, timestamp FROM signals WHERE status = 'new'")
     return cursor.fetchall()
 
 def update_signal_status(conn, signal_id, new_status='processed'):
-    """Updates a signal's status."""
     cursor = conn.cursor()
     cursor.execute("UPDATE signals SET status = ? WHERE id = ?", (new_status, signal_id))
     conn.commit()
 
 def main():
-    """The main function containing the bot's core logic."""
     log("🚀 Initializing CoinEx connection...")
     exchange = ccxt.coinex({
         'apiKey': config.COINEX_ACCESS_ID,
@@ -38,23 +34,22 @@ def main():
         'options': {'defaultType': 'swap'},
     })
     log("✅ CoinEx connection successful.")
-    if config.LEVERAGE <= 0:
-        log("❌ ERROR: Leverage is set to 0. Please set a valid leverage.")
-        return
-        
-    log(f"🤖 Trader bot started with ${config.USDT_AMOUNT} margin and {config.LEVERAGE}x leverage...")
-    
+
+    start_message = (
+        "<b>✅ Bot Started Successfully</b>\n\n"
+        f"<b>Margin:</b> ${config.USDT_AMOUNT}\n"
+        f"<b>Leverage:</b> {config.LEVERAGE}x"
+    )
+    send_message(start_message) # <-- TELEGRAM NOTIFICATION
+
     while True:
-        conn = None  # Reset connection variable at the start of the loop
+        conn = None
         try:
-            # FIX: Connect to the database INSIDE the loop to get a fresh view of the data
             conn = sqlite3.connect(DB_NAME)
             new_signals = get_new_signals(conn)
 
             if not new_signals:
                 log("No new signals to process.")
-            else:
-                log(f"Found {len(new_signals)} new signals.")
 
             for signal in new_signals:
                 signal_id, symbol, side, price, signal_timestamp = signal
@@ -62,7 +57,7 @@ def main():
                 
                 log(f"🔥 Processing task! Signal ID: {signal_id}, Symbol: {symbol}, Side: {order_side}, Price: {price}")
 
-                # --- Stale Signal Validation ---
+                # Stale Signal Validation
                 current_utc_time = datetime.now(timezone.utc)
                 signal_utc_time = datetime.fromtimestamp(float(signal_timestamp), tz=timezone.utc)
                 time_difference = current_utc_time - signal_utc_time
@@ -72,7 +67,7 @@ def main():
                     update_signal_status(conn, signal_id, 'processed_burnt')
                     continue
                 
-                # --- Reversing Logic ---
+                # Reversing Logic
                 if symbol in active_positions:
                     existing_position = active_positions[symbol]
                     if existing_position['side'] != order_side:
@@ -83,6 +78,16 @@ def main():
                                 symbol, 'limit', close_side, existing_position['amount'], price, {'reduceOnly': True}
                             )
                             log(f"   ✅ Closing order placed. ID: {closing_order['id']}")
+                            
+                            close_message = (
+                                f"<b>⏳ Position Closed (Reversing)</b>\n\n"
+                                f"<b>Symbol:</b> {symbol}\n"
+                                f"<b>Side:</b> {existing_position['side'].upper()}\n"
+                                f"<b>Amount:</b> {existing_position['amount']}\n"
+                                f"<b>Close Price:</b> {price}"
+                            )
+                            send_message(close_message) # <-- TELEGRAM NOTIFICATION
+                            
                             time.sleep(5)
                         except Exception as e:
                             log(f"   ❌ CRITICAL: Failed to close position. Error: {e}")
@@ -94,43 +99,45 @@ def main():
                         update_signal_status(conn, signal_id)
                         continue
 
-                # --- Open New Position ---
+                # Open New Position
                 log("-> Proceeding to open new position.")
-                try:
-                    exchange.set_margin_mode('isolated', symbol)
-                    exchange.set_leverage(config.LEVERAGE, symbol)
-                except Exception as e:
-                    log(f"⚠️ Warning: Could not set margin/leverage. Error: {e}")
-
                 total_position_value = config.USDT_AMOUNT * config.LEVERAGE
                 amount_to_trade = total_position_value / price
                 
-                log(f"   -> Placing new {order_side.upper()} order for {amount_to_trade:.8f}...")
                 new_order = exchange.create_order(symbol, 'limit', order_side, amount_to_trade, price)
                 log(f"✅ New position opened successfully! ID: {new_order['id']}")
 
+                open_message = (
+                    f"<b>{'📈' if order_side == 'buy' else '📉'} New Position Opened ({order_side.upper()})</b>\n\n"
+                    f"<b>Symbol:</b> {symbol}\n"
+                    f"<b>Price:</b> {price}\n"
+                    f"<b>Amount:</b> {amount_to_trade:.6f}\n"
+                    f"<b>Value:</b> ${total_position_value:.2f}"
+                )
+                send_message(open_message) # <-- TELEGRAM NOTIFICATION
+
                 active_positions[symbol] = new_order
-                log(f"   -> New position state saved to memory.")
-                
                 update_signal_status(conn, signal_id)
 
         except KeyboardInterrupt:
-            # Handle Ctrl+C gracefully
             log("🛑 User interrupted the process. Shutting down.")
+            send_message("<b>🛑 Bot Stopped Manually</b>") # <-- TELEGRAM NOTIFICATION
             break
         except Exception as e:
             log(f"❌ An unexpected error occurred in the main loop: {e}")
+            error_message = (
+                f"<b>❌ CRITICAL ERROR</b>\n\n"
+                f"Bot stopped unexpectedly.\n\n"
+                f"<b>Error:</b>\n<code>{e}</code>"
+            )
+            send_message(error_message) # <-- TELEGRAM NOTIFICATION
+            break
         finally:
-            # Ensure the connection is always closed after each cycle
             if conn:
                 conn.close()
             
-            # This check prevents sleeping after a KeyboardInterrupt
-            if 'e' in locals() and isinstance(e, KeyboardInterrupt):
-                pass
-            else:
-                log(f"Waiting for {POLL_INTERVAL} seconds...")
-                time.sleep(POLL_INTERVAL)
+            log(f"Waiting for {POLL_INTERVAL} seconds...")
+            time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
