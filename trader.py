@@ -1,4 +1,4 @@
-# trader.py (نسخه نهایی و هماهنگ)
+# trader.py (نسخه نهایی با لاگ‌های خلوت)
 
 import ccxt
 import sqlite3
@@ -43,7 +43,7 @@ def main():
         return
 
     start_message = (
-        "<b>✅ Bot Started Successfully</b>\n\n"
+        "<b>✅ Trader Bot Started Successfully</b>\n\n"
         f"<b>Margin:</b> ${config.USDT_AMOUNT}\n"
         f"<b>Leverage:</b> {config.LEVERAGE}x"
     )
@@ -52,7 +52,6 @@ def main():
     while True:
         conn = None
         try:
-            # اتصال بهینه به دیتابیس برای جلوگیری از قفل شدن
             conn = sqlite3.connect(DB_NAME, timeout=15)
             conn.execute('PRAGMA journal_mode=WAL;')
             
@@ -75,6 +74,7 @@ def main():
                 if time_difference.total_seconds() > (MAX_SIGNAL_AGE_MINUTES * 60):
                     log(f"🟡 SKIPPING (Burnt Signal): Signal is older than {MAX_SIGNAL_AGE_MINUTES} minutes.")
                     update_signal_status(conn, signal_id, 'processed_burnt')
+                    # --- نوتیفیکیشن سیگنال سوخته از این قسمت حذف شد ---
                     continue
                 
                 # Reversing Logic
@@ -83,13 +83,32 @@ def main():
                     if existing_position['side'] != order_side:
                         log(f"-> Reverse signal detected! Closing existing {existing_position['side'].upper()} position.")
                         try:
-                            # ... (منطق بستن پوزیشن مانند قبل)
-                            log(f"   ✅ Closing order placed.")
+                            close_side = 'sell' if existing_position['side'] == 'buy' else 'buy'
+                            closing_order = exchange.create_order(
+                                symbol, 'limit', close_side, existing_position['amount'], price, {'reduceOnly': True}
+                            )
+                            log(f"   ✅ Closing order placed. ID: {closing_order['id']}")
+                            
+                            close_message = (
+                                f"<b>⏳ Position Closed (Reversing)</b>\n\n"
+                                f"<b>Symbol:</b> {symbol}\n"
+                                f"<b>Side:</b> {existing_position['side'].upper()}\n"
+                                f"<b>Amount:</b> {existing_position['amount']}\n"
+                                f"<b>Close Price:</b> {price}"
+                            )
+                            send_message(close_message)
+                            
+                            time.sleep(5)
                             del active_positions[symbol]
-                            time.sleep(5) # Give time for the close order to process
                         except Exception as e:
                             log(f"   ❌ CRITICAL: Failed to close position for reversing. Error: {e}")
                             update_signal_status(conn, signal_id, 'processed_error')
+                            error_message = (
+                                f"<b>❌ CRITICAL: Failed to Close Position</b>\n\n"
+                                f"<b>Symbol:</b> {symbol}\n"
+                                f"<b>Error:</b>\n<code>{e}</code>"
+                            )
+                            send_message(error_message)
                             continue
                     else:
                         log(f"-> Signal side is the same. Skipping.")
@@ -118,16 +137,17 @@ def main():
 
         except sqlite3.Error as e:
             log(f"❌ Database Error in trader: {e}")
+            send_message(f"<b>❌ Database Error (Trader)</b>\n\n<b>Error:</b>\n<code>{e}</code>")
         except ccxt.BaseError as e:
             log(f"❌ Exchange Error in trader: {e}")
             send_message(f"<b>⚠️ Exchange Warning</b>\n\nAn error occurred while communicating with CoinEx.\n\n<b>Error:</b>\n<code>{e}</code>")
         except KeyboardInterrupt:
             log("🛑 User interrupted the process. Shutting down.")
-            send_message("<b>🛑 Bot Stopped Manually</b>")
+            send_message("<b>🛑 Trader Bot Stopped Manually</b>")
             break
         except Exception as e:
             log(f"❌ An unexpected error occurred in the main loop: {e}")
-            error_message = f"<b>❌ CRITICAL ERROR</b>\n\nBot stopped unexpectedly.\n\n<b>Error:</b>\n<code>{e}</code>"
+            error_message = f"<b>❌ CRITICAL ERROR (Trader Loop)</b>\n\nBot stopped unexpectedly.\n\n<b>Error:</b>\n<code>{e}</code>"
             send_message(error_message)
             break
         finally:

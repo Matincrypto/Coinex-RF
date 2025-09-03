@@ -1,9 +1,10 @@
-# signal_listener.py (نسخه نهایی و هماهنگ)
+# signal_listener.py (نسخه نهایی با لاگ‌های خلوت)
 
 import requests
 import sqlite3
 import time
 from datetime import datetime, timezone
+from telegram_logger import send_message
 
 # --- Configurations ---
 API_URL = "http://103.75.198.172:8080/signals"
@@ -19,15 +20,12 @@ def log(message):
 def setup_database():
     """
     Creates the database and sets up WAL mode for better concurrency.
-    The UNIQUE INDEX is removed to allow all signals to be stored.
     """
+    conn = None
     try:
         conn = sqlite3.connect(DB_NAME, timeout=15)
         cursor = conn.cursor()
-        
-        # فعال کردن حالت WAL برای جلوگیری از قفل شدن دیتابیس
         cursor.execute('PRAGMA journal_mode=WAL;')
-
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,9 +38,11 @@ def setup_database():
             )
         ''')
         conn.commit()
-        log("✅ Database is ready in WAL mode. All incoming signals will be stored.")
+        log("✅ Database is ready in WAL mode.")
     except Exception as e:
-        log(f"❌ CRITICAL ERROR during database setup: {e}")
+        error_msg = f"<b>❌ CRITICAL ERROR (Listener)</b>\n\nFailed during database setup.\n\n<b>Error:</b>\n<code>{e}</code>"
+        log(f"CRITICAL ERROR during database setup: {e}")
+        send_message(error_msg)
     finally:
         if conn:
             conn.close()
@@ -50,6 +50,7 @@ def setup_database():
 def fetch_and_store_signals():
     """
     Fetches signals from the API and stores all of them in the database.
+    Sends Telegram notifications only on failure.
     """
     conn = None
     try:
@@ -73,7 +74,6 @@ def fetch_and_store_signals():
                     symbol = signal['symbol']
                     side = signal['signal_type']
                     price = signal['price']
-                    
                     date_string = signal['signal_time_utc']
                     dt_object = datetime.strptime(date_string, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                     timestamp = int(dt_object.timestamp())
@@ -90,15 +90,24 @@ def fetch_and_store_signals():
             conn.commit()
             if new_signals_count > 0:
                 log(f"  -> 🎉 Stored {new_signals_count} new signals in the database.")
+                # --- نوتیفیکیشن دریافت سیگنال جدید از این قسمت حذف شد ---
         else:
-            log(f"⚠️  API request failed with status code: {response.status_code}")
+            error_msg = f"<b>⚠️ API Request Failed (Listener)</b>\n\nStatus Code: {response.status_code}"
+            log(error_msg)
+            send_message(error_msg)
 
     except requests.exceptions.RequestException as e:
-        log(f"❌ Network Error: Could not connect to API. Details: {e}")
+        error_msg = f"<b>❌ Network Error (Listener)</b>\n\nCould not connect to API.\n\n<b>Error:</b>\n<code>{e}</code>"
+        log(error_msg)
+        send_message(error_msg)
     except sqlite3.Error as e:
-        log(f"❌ Database Error in listener: {e}")
+        error_msg = f"<b>❌ Database Error (Listener)</b>\n\n<b>Error:</b>\n<code>{e}</code>"
+        log(error_msg)
+        send_message(error_msg)
     except Exception as e:
-        log(f"❌ An unexpected error occurred in listener: {e}")
+        error_msg = f"<b>❌ Unexpected Error (Listener)</b>\n\n<b>Error:</b>\n<code>{e}</code>"
+        log(error_msg)
+        send_message(error_msg)
     finally:
         if conn:
             conn.close()
@@ -107,6 +116,7 @@ def fetch_and_store_signals():
 if __name__ == "__main__":
     setup_database()
     log("\n🚀 Starting the signal listener... Press Ctrl+C to stop.")
+    send_message("<b>🚀 Listener Bot Started</b>")
     
     while True:
         try:
@@ -116,7 +126,10 @@ if __name__ == "__main__":
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             log("🛑 User interrupted the listener. Shutting down.")
+            send_message("<b>🛑 Listener Bot Stopped Manually</b>")
             break
         except Exception as e:
-            log(f"❌ CRITICAL ERROR in listener main loop: {e}")
-            time.sleep(POLL_INTERVAL) # Wait before retrying
+            error_msg = f"<b>❌ CRITICAL ERROR (Listener Loop)</b>\n\n<b>Error:</b>\n<code>{e}</code>"
+            log(error_msg)
+            send_message(error_msg)
+            time.sleep(POLL_INTERVAL)
