@@ -9,4 +9,5 @@ USDT_AMOUNT = 10
 
 # The leverage to be used for all trades.
 
-LEVERAGE = 0
+LEVERAGE = 5
+
