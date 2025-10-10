@@ -1,48 +1,23 @@
-# trader.py (نسخه نهایی با MySQL و لاگ کامل)
+# trader.py (نسخه جدید با لاگ فارسی و دیتابیس هوشمند)
 
 import ccxt
-import mysql.connector
 import time
 from datetime import datetime, timezone
-import config  # ایمپورت کردن فایل تنظیمات جدید
+import config
 from telegram_logger import send_message
+from shared_utils import log, create_db_connection, setup_database
 
-# --- Global Variables ---
-POLL_INTERVAL = 10  # فاصله زمانی بین هر بررسی (ثانیه)
-MAX_SIGNAL_AGE_MINUTES = 5  # حداکثر عمر سیگنال به دقیقه
-
-# --- Helper Function for Console Logging ---
-def log(message):
-    """یک پیام را با فرمت زمانی استاندارد UTC چاپ می‌کند."""
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp} UTC] {message}")
-
-# --- Database Functions (MySQL Version) ---
-
-def create_db_connection():
-    """یک اتصال جدید به دیتابیس MySQL ایجاد می‌کند و آن را برمی‌گرداند."""
-    try:
-        conn = mysql.connector.connect(
-            host=config.DB_HOST,
-            user=config.DB_USER,
-            password=config.DB_PASSWORD,
-            database=config.DB_NAME,
-            port=config.DB_PORT
-        )
-        if conn.is_connected():
-            log("✅ Successfully connected to MySQL database.")
-            return conn
-    except mysql.connector.Error as e:
-        log(f"❌ DATABASE CRITICAL: Could not connect to MySQL. Error: {e}")
-        send_message(f"<b>❌ CRITICAL: MySQL Connection Failed</b>\n\n<b>Error:</b>\n<code>{e}</code>")
-        return None
+MAX_SIGNAL_AGE_MINUTES = 5
 
 def get_new_signal(conn):
     """یک سیگنال جدید از دیتابیس MySQL دریافت می‌کند."""
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True) # dictionary=True برای دسترسی به ستون‌ها با نام
     query = "SELECT symbol, side, price, timestamp, signal_id FROM signals WHERE status = 'new' ORDER BY updated_at ASC LIMIT 1"
     cursor.execute(query)
-    return cursor.fetchone()
+    signal = cursor.fetchone()
+    if signal:
+        log(f"🔥 سیگنال جدید پیدا شد: {signal['symbol']} | {signal['side']} | شناسه: {signal['signal_id']}")
+    return signal
 
 def update_signal_status(conn, symbol, new_status):
     """وضعیت یک سیگنال را در دیتابیس MySQL به‌روزرسانی می‌کند."""
@@ -51,169 +26,125 @@ def update_signal_status(conn, symbol, new_status):
         query = "UPDATE signals SET status = %s WHERE symbol = %s"
         cursor.execute(query, (new_status, symbol))
         conn.commit()
-        log(f"   -> DB: Updated status for {symbol} to '{new_status}'.")
-    except mysql.connector.Error as e:
-        log(f"   -> ❌ DB ERROR: Failed to update status for {symbol}. Error: {e}")
-        # در صورت بروز خطا، اتصال را بازنشانی می‌کنیم تا در حلقه بعدی مشکل ایجاد نشود
+        log(f"   -> وضعیت سیگنال {symbol} در دیتابیس به '{new_status}' تغییر کرد.")
+    except Exception as e:
+        log(f"   -> ❌ خطا در آپدیت وضعیت سیگنال {symbol}. خطا: {e}")
         conn.rollback()
 
-# --- Exchange Functions ---
-
-def get_active_positions(exchange):
-    """موقعیت‌های باز فعلی را از صرافی دریافت می‌کند."""
+def process_trades(exchange):
+    """منطق اصلی پردازش معاملات را اجرا می‌کند."""
+    conn = None
     try:
-        log("-> Fetching open positions from CoinEx (Swap)...")
+        log("--- شروع چرخه جدید تريد ---")
+        # ۱. دریافت پوزیشن‌های فعال از صرافی
+        log("۱. در حال دریافت پوزیشن‌های باز از صرافی...")
         params = {'type': 'swap'}
         all_positions = exchange.fetch_positions(None, params)
-        
-        open_positions = [p for p in all_positions if float(p.get('contracts', p.get('size', 0))) > 0]
-        
-        active_positions = {
-            pos['symbol']: {
-                'side': pos['side'],
-                'contracts': float(pos.get('contracts', pos.get('size', 0))),
-                'entryPrice': float(pos['entryPrice'])
-            } for pos in open_positions
-        }
-        
-        if active_positions:
-            log(f"-> Found {len(active_positions)} open position(s): {list(active_positions.keys())}")
+        open_positions = {p['symbol']: p for p in all_positions if float(p.get('contracts', 0)) > 0}
+        if open_positions:
+            log(f"   -> {len(open_positions)} پوزیشن باز پیدا شد: {list(open_positions.keys())}")
         else:
-            log("-> No open positions found.")
+            log("   -> هیچ پوزیشن بازی در صرافی وجود ندارد.")
+
+        # ۲. اتصال به دیتابیس و دریافت سیگنال جدید
+        conn = create_db_connection()
+        if not conn:
+            log("پردازش به دلیل عدم اتصال به دیتابیس متوقف شد.")
+            return
+
+        signal = get_new_signal(conn)
+        if not signal:
+            log("۲. سیگنال جدیدی برای پردازش در دیتابیس وجود ندارد.")
+            return
+        
+        log(f"۲. در حال پردازش سیگنال برای نماد {signal['symbol']}...")
+
+        # ۳. بررسی تاریخ انقضای سیگنال (سیگنال سوخته)
+        signal_age = datetime.now(timezone.utc) - datetime.fromtimestamp(signal['timestamp'], tz=timezone.utc)
+        if signal_age.total_seconds() > (MAX_SIGNAL_AGE_MINUTES * 60):
+            log(f"🟡 سیگنال نادیده گرفته شد (سوخته). عمر سیگنال: {signal_age}")
+            update_signal_status(conn, signal['symbol'], 'processed_burnt')
+            return
+
+        # ۴. منطق اصلی معامله
+        symbol, order_side = signal['symbol'], signal['side'].lower()
+        price = signal['price']
+        
+        if symbol in open_positions:
+            existing_pos = open_positions[symbol]
+            log(f"   -> یک پوزیشن '{existing_pos['side'].upper()}' برای {symbol} از قبل باز است.")
             
-        return active_positions
+            if existing_pos['side'] != order_side:
+                log(f"   -> سیگنال معکوس شناسایی شد! در حال بستن پوزیشن فعلی...")
+                try:
+                    close_side = 'sell' if existing_pos['side'] == 'buy' else 'buy'
+                    closing_order = exchange.create_order(symbol, 'limit', close_side, existing_pos['contracts'], price, {'reduceOnly': True})
+                    log(f"   ✅ سفارش بستن پوزیشن با موفقیت ثبت شد. شناسه: {closing_order['id']}")
+                    send_message(f"<b>⏳ بستن پوزیشن (سیگنال معکوس)</b>\n\n<b>نماد:</b> {symbol}\n<b>جهت:</b> {existing_pos['side'].upper()}")
+                except Exception as e:
+                    log(f"   ❌ خطا در بستن پوزیشن معکوس. خطا: {e}")
+                    send_message(f"<b>❌ خطا در بستن پوزیشن</b>\n\n<b>نماد:</b> {symbol}\n<b>خطا:</b>\n<code>{e}</code>")
+                    update_signal_status(conn, symbol, 'processed_error')
+            else:
+                log("   -> سیگنال هم‌جهت با پوزیشن فعلی است. نادیده گرفته شد.")
+                update_signal_status(conn, symbol, 'processed_duplicate')
+        else:
+            log("   -> پوزیشن بازی برای این نماد وجود ندارد. در حال باز کردن پوزیشن جدید...")
+            try:
+                total_value = config.USDT_AMOUNT * config.LEVERAGE
+                amount_to_trade = total_value / price
+                log(f"   -> محاسبه مقادیر: مارجین=${config.USDT_AMOUNT}, لوریج={config.LEVERAGE}x, مقدار ارز={amount_to_trade:.6f}")
+                
+                new_order = exchange.create_order(symbol, 'limit', order_side, amount_to_trade, price)
+                log(f"   ✅ پوزیشن جدید با موفقیت باز شد! شناسه سفارش: {new_order['id']}")
+                send_message(f"<b>{'📈' if order_side == 'buy' else '📉'} باز شدن پوزیشن جدید</b>\n\n"
+                             f"<b>نماد:</b> {symbol}\n<b>جهت:</b> {order_side.upper()}\n<b>قیمت:</b> {price}\n"
+                             f"<b>مقدار:</b> {amount_to_trade:.6f}")
+                update_signal_status(conn, symbol, 'processed')
+            except Exception as e:
+                log(f"   ❌ خطا در باز کردن پوزیشن جدید. خطا: {e}")
+                send_message(f"<b>❌ خطا در باز کردن پوزیشن</b>\n\n<b>نماد:</b> {symbol}\n<b>خطا:</b>\n<code>{e}</code>")
+                update_signal_status(conn, symbol, 'processed_error')
+
+    except ccxt.BaseError as e:
+        log(f"❌ خطای ارتباط با صرافی. خطا: {e}")
     except Exception as e:
-        log(f"❌ EXCHANGE ERROR: Could not fetch positions: {e}")
-        send_message(f"<b>⚠️ Warning: Could not fetch positions</b>\n\n<b>Error:</b>\n<code>{e}</code>")
-        return None
+        log(f"❌ یک خطای پیش‌بینی نشده در Trader رخ داد. خطا: {e}")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+            log("اتصال به دیتابیس بسته شد.")
 
-# --- Main Bot Logic ---
-
-def main():
-    log("🚀 Initializing CoinEx connection...")
+if __name__ == "__main__":
+    log("🚀 ربات معامله‌گر (Trader) در حال شروع به کار...")
     try:
         exchange = ccxt.coinex({
             'apiKey': config.COINEX_ACCESS_ID,
             'secret': config.COINEX_SECRET_KEY,
             'options': {'defaultType': 'swap'},
         })
-        log("✅ CoinEx connection successful.")
-    except Exception as e:
-        log(f"❌ CRITICAL: Failed to connect to CoinEx. Shutting down. Error: {e}")
-        send_message(f"<b>❌ CRITICAL ERROR</b>\n\nFailed to connect to CoinEx.\n\n<b>Error:</b>\n<code>{e}</code>")
-        return
-
-    start_message = (
-        f"<b>✅ Trader Bot Started (MySQL Version)</b>\n\n"
-        f"<b>Margin:</b> ${config.USDT_AMOUNT}\n"
-        f"<b>Leverage:</b> {config.LEVERAGE}x"
-    )
-    send_message(start_message)
-
-    while True:
-        conn = None
-        try:
-            # 1. اتصال به دیتابیس
-            conn = create_db_connection()
-            if not conn:
-                log("Database connection failed. Retrying in a moment...")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            # 2. دریافت موقعیت‌های فعال از صرافی
-            active_positions = get_active_positions(exchange)
-            if active_positions is None:
-                log("Could not get active positions. Skipping this cycle.")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            # 3. دریافت سیگنال جدید از دیتابیس
-            signal = get_new_signal(conn)
-
-            if not signal:
-                log("No new signals to process.")
+        log("✅ با موفقیت به صرافی CoinEx متصل شد.")
+        send_message(f"<b>✅ Trader Bot Started (Robust Version)</b>\n\n"
+                     f"<b>Margin:</b> ${config.USDT_AMOUNT}\n<b>Leverage:</b> {config.LEVERAGE}x")
+        
+        db_conn = create_db_connection()
+        if db_conn:
+            if setup_database(db_conn):
+                db_conn.close()
+                while True:
+                    process_trades(exchange)
+                    wait_interval = config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10
+                    log(f"--- چرخه تمام شد. انتظار برای {wait_interval} ثانیه... ---")
+                    time.sleep(wait_interval)
             else:
-                symbol, side, price, signal_timestamp, signal_id = signal
-                order_side = side.lower()
-                
-                log(f"🔥 Processing Signal ID: {signal_id} | Symbol: {symbol} | Side: {order_side} | Price: {price}")
+                db_conn.close()
+                log("❌ ربات به دلیل عدم موفقیت در راه‌اندازی دیتابیس، متوقف شد.")
+        else:
+            log("❌ ربات به دلیل عدم اتصال به دیتابیس، متوقف شد.")
 
-                # 4. بررسی تاریخ انقضای سیگنال (سیگنال سوخته)
-                current_utc_time = datetime.now(timezone.utc)
-                signal_utc_time = datetime.fromtimestamp(float(signal_timestamp), tz=timezone.utc)
-                time_difference = current_utc_time - signal_utc_time
-                
-                if time_difference.total_seconds() > (MAX_SIGNAL_AGE_MINUTES * 60):
-                    log(f"🟡 SKIPPING (Burnt Signal): Signal is older than {MAX_SIGNAL_AGE_MINUTES} minutes.")
-                    update_signal_status(conn, symbol, 'processed_burnt')
-                    continue
-                
-                # 5. بررسی منطق معاملاتی بر اساس موقعیت‌های باز
-                if symbol in active_positions:
-                    existing_position = active_positions[symbol]
-                    if existing_position['side'] != order_side:
-                        log(f"-> Reverse signal detected! Attempting to close existing {existing_position['side'].upper()} position for {symbol}.")
-                        try:
-                            close_side = 'sell' if existing_position['side'] == 'buy' else 'buy'
-                            params = {'reduceOnly': True}
-                            closing_order = exchange.create_order(symbol, 'limit', close_side, existing_position['contracts'], price, params)
-                            log(f"   ✅ Closing order placed. ID: {closing_order['id']}")
-                            send_message(f"<b>⏳ Position Closing (Reversing)</b>\n\n"
-                                         f"<b>Symbol:</b> {symbol}\n<b>Side:</b> {existing_position['side'].upper()}\n"
-                                         f"<b>Amount:</b> {existing_position['contracts']}\n<b>Close Price:</b> {price}")
-                            time.sleep(5) # کمی تاخیر برای اطمینان از پردازش سفارش
-                        except Exception as e:
-                            log(f"   ❌ CRITICAL: Failed to close reverse position for {symbol}. Error: {e}")
-                            update_signal_status(conn, symbol, 'processed_error')
-                            send_message(f"<b>❌ CRITICAL: Failed to Close Position</b>\n\n"
-                                         f"<b>Symbol:</b> {symbol}\n<b>Error:</b>\n<code>{e}</code>")
-                            continue # ادامه به سیگنال بعدی برای جلوگیری از باز کردن پوزیشن جدید
-                    else:
-                        log(f"-> Signal has same side as active position for {symbol}. Skipping.")
-                        update_signal_status(conn, symbol, 'processed_duplicate')
-                        continue
-
-                # 6. باز کردن موقعیت جدید
-                log(f"-> Proceeding to open new {order_side.upper()} position for {symbol}.")
-                try:
-                    total_position_value = config.USDT_AMOUNT * config.LEVERAGE
-                    amount_to_trade = total_position_value / price
-                    
-                    new_order = exchange.create_order(symbol, 'limit', order_side, amount_to_trade, price)
-                    log(f"✅ New position opened successfully! ID: {new_order['id']}")
-
-                    send_message(f"<b>{'📈' if order_side == 'buy' else '📉'} New Position Opened ({order_side.upper()})</b>\n\n"
-                                 f"<b>Symbol:</b> {symbol}\n<b>Price:</b> {price}\n"
-                                 f"<b>Amount:</b> {amount_to_trade:.6f}\n<b>Value:</b> ${total_position_value:.2f}")
-                    
-                    update_signal_status(conn, symbol, 'processed')
-                except Exception as e:
-                    log(f"❌ CRITICAL: Failed to open new position for {symbol}. Error: {e}")
-                    update_signal_status(conn, symbol, 'processed_error')
-                    send_message(f"<b>❌ CRITICAL: Failed to Open Position</b>\n\n"
-                                 f"<b>Symbol:</b> {symbol}\n<b>Error:</b>\n<code>{e}</code>")
-
-        except mysql.connector.Error as e:
-            log(f"❌ DATABASE ERROR in main loop: {e}")
-            send_message(f"<b>❌ Database Error (Trader Loop)</b>\n\n<b>Error:</b>\n<code>{e}</code>")
-        except ccxt.BaseError as e:
-            log(f"❌ EXCHANGE ERROR in main loop: {e}")
-            send_message(f"<b>⚠️ Exchange Warning</b>\n\nAn error occurred with CoinEx.\n\n<b>Error:</b>\n<code>{e}</code>")
-        except KeyboardInterrupt:
-            log("🛑 User interrupted the process. Shutting down.")
-            send_message("<b>🛑 Trader Bot Stopped Manually</b>")
-            break
-        except Exception as e:
-            log(f"❌ An unexpected critical error occurred in the main loop: {e}")
-            send_message(f"<b>❌ CRITICAL ERROR (Trader Loop)</b>\n\nBot will be stopped.\n\n<b>Error:</b>\n<code>{e}</code>")
-            break # در خطاهای ناشناخته بهتر است ربات متوقف شود
-        finally:
-            if conn and conn.is_connected():
-                conn.close()
-                log("Database connection closed.")
-            
-            log(f"--- Cycle finished. Waiting for {POLL_INTERVAL} seconds... ---")
-            time.sleep(POLL_INTERVAL)
-
-if __name__ == "__main__":
-    main()
+    except KeyboardInterrupt:
+        log("🛑 ربات معامله‌گر با دستور کاربر متوقف شد.")
+        send_message("<b>🛑 Trader Bot Stopped Manually</b>")
+    except Exception as e:
+        log(f"❌ یک خطای حیاتی در هنگام شروع به کار Trader رخ داد. خطا: {e}")
+        send_message(f"<b>❌ CRITICAL ERROR (Trader Start)</b>\n\n<b>Error:</b>\n<code>{e}</code>")
