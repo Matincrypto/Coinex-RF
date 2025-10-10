@@ -1,82 +1,35 @@
-# signal_listener.py (نسخه جدید با MySQL)
+# signal_listener.py (نسخه جدید با لاگ فارسی و دیتابیس هوشمند)
 
 import requests
-import mysql.connector
 import time
 from datetime import datetime, timezone
 from telegram_logger import send_message
 import config
-
-# --- Helper Function for Logging ---
-def log(message):
-    """Prints a message with a standard UTC timestamp."""
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp} UTC] {message}")
-
-def create_db_connection():
-    """Creates a new connection to the MySQL database."""
-    try:
-        conn = mysql.connector.connect(
-            host=config.DB_HOST,
-            user=config.DB_USER,
-            password=config.DB_PASSWORD,
-            database=config.DB_NAME,
-            port=config.DB_PORT
-        )
-        return conn
-    except mysql.connector.Error as e:
-        error_msg = f"<b>❌ CRITICAL ERROR (Listener)</b>\n\nFailed to connect to MySQL DB.\n\n<b>Error:</b>\n<code>{e}</code>"
-        log(f"CRITICAL ERROR during DB connection: {e}")
-        send_message(error_msg)
-        return None
-
-def setup_database(conn):
-    """Creates the necessary tables in the database if they don't exist."""
-    try:
-        cursor = conn.cursor()
-        # جدول اصلی سیگنال‌ها
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS signals (
-                symbol VARCHAR(20) PRIMARY KEY,
-                side VARCHAR(10) NOT NULL,
-                price DOUBLE NOT NULL,
-                timestamp BIGINT NOT NULL,
-                status VARCHAR(20) NOT NULL,
-                signal_id VARCHAR(50) NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )
-        ''')
-        # جدولی برای نگهداری تمام signal_id های دیده شده
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS processed_signal_ids (
-                signal_id VARCHAR(50) PRIMARY KEY
-            )
-        ''')
-        conn.commit()
-        log("✅ Database tables are ready.")
-    except mysql.connector.Error as e:
-        error_msg = f"<b>❌ CRITICAL ERROR (Listener)</b>\n\nFailed during database setup.\n\n<b>Error:</b>\n<code>{e}</code>"
-        log(f"CRITICAL ERROR during database setup: {e}")
-        send_message(error_msg)
+from shared_utils import log, create_db_connection, setup_database
 
 def fetch_and_store_signals():
-    """Fetches signals and stores them in the MySQL database."""
+    """سیگنال‌ها را دریافت و در دیتابیس MySQL ذخیره می‌کند."""
     conn = None
     try:
+        log("--- شروع چرخه جدید دریافت سیگنال ---")
+        log("۱. در حال ارسال درخواست به API سیگنال...")
         response = requests.get(config.API_URL, timeout=10)
+
         if response.status_code == 200:
             signals_data = response.json()
             if not signals_data:
-                log("No new signals received from API.")
+                log(" API سیگنال جدیدی ارسال نکرده است.")
                 return
 
             if isinstance(signals_data, dict):
                 signals_data = [signals_data]
 
-            log(f"Received {len(signals_data)} signal(s) from API. Processing...")
-
+            log(f" API تعداد {len(signals_data)} سیگنال ارسال کرد. در حال پردازش...")
+            
             conn = create_db_connection()
-            if not conn: return
+            if not conn:
+                log("پردازش به دلیل عدم اتصال به دیتابیس متوقف شد.")
+                return
             
             cursor = conn.cursor()
             updated_symbols = 0
@@ -85,78 +38,79 @@ def fetch_and_store_signals():
                 try:
                     signal_id = signal['signal_id']
                     symbol = signal['symbol']
+                    log(f"-> پردازش سیگنال برای {symbol} با شناسه: {signal_id}")
+
+                    # ۱. بررسی تکراری بودن شناسه سیگنال
+                    cursor.execute('SELECT signal_id FROM processed_signal_ids WHERE signal_id = %s', (signal_id,))
+                    if cursor.fetchone():
+                        log(f"  - نادیده گرفته شد: شناسه سیگنال '{signal_id}' تکراری است.")
+                        continue
+
+                    # ۲. استخراج و تبدیل اطلاعات سیگنال
                     side = signal['signal_side'].upper()
                     price = float(signal['entry_price'])
                     dt_object = datetime.strptime(signal['creation_time_utc'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                     timestamp = int(dt_object.timestamp())
+                    log(f"  - اطلاعات سیگنال: جهت={side}, قیمت={price}, زمان={dt_object}")
 
-                    # 1. Check if signal_id has been processed
-                    cursor.execute('SELECT signal_id FROM processed_signal_ids WHERE signal_id = %s', (signal_id,))
-                    if cursor.fetchone():
-                        log(f"  -> Ignoring duplicate signal_id: {signal_id} for {symbol}")
-                        continue
-
-                    # 2. INSERT OR UPDATE the signal for the symbol (MySQL syntax)
-                    # This is known as "INSERT ... ON DUPLICATE KEY UPDATE"
+                    # ۳. درج یا به‌روزرسانی سیگنال در جدول اصلی
                     insert_query = '''
                         INSERT INTO signals (symbol, side, price, timestamp, status, signal_id)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, 'new', %s)
                         ON DUPLICATE KEY UPDATE
                         side = VALUES(side), price = VALUES(price), timestamp = VALUES(timestamp),
-                        status = VALUES(status), signal_id = VALUES(signal_id)
+                        status = 'new', signal_id = VALUES(signal_id)
                     '''
-                    cursor.execute(insert_query, (symbol, side, price, timestamp, 'new', signal_id))
+                    cursor.execute(insert_query, (symbol, side, price, timestamp, signal_id))
+                    log(f"  - سیگنال برای نماد {symbol} در جدول 'signals' با موفقیت درج/به‌روزرسانی شد.")
 
-                    # 3. Add the new signal_id to the processed list
+                    # ۴. افزودن شناسه به لیست پردازش‌شده‌ها
                     cursor.execute('INSERT INTO processed_signal_ids (signal_id) VALUES (%s)', (signal_id,))
+                    log(f"  - شناسه سیگنال '{signal_id}' به جدول 'processed_signal_ids' اضافه شد.")
                     
-                    log(f"  -> 🎉 Stored/Updated signal for {symbol} with new signal_id: {signal_id}")
                     updated_symbols += 1
 
                 except (KeyError, ValueError) as e:
-                    log(f"  -> ⚠️  Warning: Signal with unexpected format. Skipping. Data: {signal}, Error: {e}")
+                    log(f"  - ⚠️ هشدار: فرمت سیگنال غیرمنتظره است. رد شدن... خطا: {e}")
 
             conn.commit()
             if updated_symbols > 0:
-                log(f"✅ Finished processing. {updated_symbols} symbol(s) were updated.")
+                log(f"✅ پردازش با موفقیت تمام شد. {updated_symbols} نماد به‌روزرسانی شدند.")
         else:
-            log(f"API Request Failed. Status Code: {response.status_code}")
+            log(f"⚠️ درخواست به API ناموفق بود. کد وضعیت: {response.status_code}")
 
     except requests.exceptions.RequestException as e:
-        log(f"Network Error: Could not connect to API. {e}")
+        log(f"❌ خطای شبکه هنگام اتصال به API. خطا: {e}")
     except mysql.connector.Error as e:
-        log(f"Database Error: {e}")
+        log(f"❌ خطای دیتابیس در حین پردازش سیگنال. خطا: {e}")
     except Exception as e:
-        log(f"Unexpected Error: {e}")
+        log(f"❌ یک خطای پیش‌بینی نشده در Listener رخ داد. خطا: {e}")
     finally:
         if conn and conn.is_connected():
             conn.close()
+            log("اتصال به دیتابیس بسته شد.")
 
-# --- Main part of the script ---
 if __name__ == "__main__":
-    # Run setup once at the start
+    log("🚀 ربات شنونده سیگنال (Listener) در حال شروع به کار...")
+    send_message("<b>🚀 Listener Bot Started (Robust Version)</b>")
+    
+    # اجرای اولیه راه‌اندازی دیتابیس
     db_conn = create_db_connection()
     if db_conn:
-        setup_database(db_conn)
-        db_conn.close()
-        log("\n🚀 Starting the signal listener (MySQL)... Press Ctrl+C to stop.")
-        send_message("<b>🚀 Listener Bot Started (MySQL Version)</b>")
+        if setup_database(db_conn):
+             db_conn.close()
+             while True:
+                try:
+                    fetch_and_store_signals()
+                    wait_interval = config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10
+                    log(f"--- چرخه تمام شد. انتظار برای {wait_interval} ثانیه... ---")
+                    time.sleep(wait_interval)
+                except KeyboardInterrupt:
+                    log("🛑 ربات شنونده با دستور کاربر متوقف شد.")
+                    send_message("<b>🛑 Listener Bot Stopped Manually</b>")
+                    break
+        else:
+            db_conn.close()
+            log("❌ ربات به دلیل عدم موفقیت در راه‌اندازی دیتابیس، متوقف شد.")
     else:
-        log("Could not start listener due to DB connection failure.")
-        exit() # Exit if DB connection fails at start
-
-    while True:
-        try:
-            log(f"\n--- Checking for signals ---")
-            fetch_and_store_signals()
-            log(f"Waiting for {config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10} seconds...")
-            time.sleep(config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10)
-        except KeyboardInterrupt:
-            log("🛑 User interrupted the listener. Shutting down.")
-            send_message("<b>🛑 Listener Bot Stopped Manually</b>")
-            break
-        except Exception as e:
-            error_msg = f"<b>❌ CRITICAL ERROR (Listener Loop)</b>\n\n<b>Error:</b>\n<code>{e}</code>"
-            log(error_msg)
-            send_message(error_msg)
-            time.sleep(config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10)
+        log("❌ ربات به دلیل عدم اتصال به دیتابیس، متوقف شد.")
