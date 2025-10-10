@@ -16,8 +16,9 @@ API_URL = "http://103.75.198.172:8080/signals"
 
 # --- MySQL Database Settings ---
 # Replace these with your actual MySQL database credentials.
-DB_HOST = "localhost"  # Or your database server IP
-DB_USER = "your_mysql_user"
-DB_PASSWORD = "YourStrongPassword123!"
-DB_NAME = "coinex_rf_analysis_db" # <-- نام جدید دیتابیس
-DB_PORT = 3306  # Default MySQL port
+# --- MySQL Database Settings ---
+DB_HOST = "localhost"
+DB_USER = "bot_user"                 # <-- نام کاربری موجود شما
+DB_PASSWORD = "YourStrongPassword123!" # <-- رمز عبوری که برای این کاربر دارید
+DB_NAME = "coinex_rf_analysis_db"      # <-- نام دیتابیس جدید (تغییر نمی‌کند)
+DB_PORT = 3306
