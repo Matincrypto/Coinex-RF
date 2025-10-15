@@ -1,4 +1,4 @@
-# trader.py (نسخه جدید با لاگ فارسی و دیتابیس هوشمند)
+# trader.py (نسخه جدید با حلقه تکرار هوشمند برای فاندینگ)
 
 import ccxt
 import time
@@ -8,10 +8,48 @@ from telegram_logger import send_message
 from shared_utils import log, create_db_connection, setup_database
 
 MAX_SIGNAL_AGE_MINUTES = 5
+RETRY_INTERVAL_SECONDS = 30 # فاصله زمانی برای تلاش مجدد هنگام تسویه فاندینگ
+
+def get_active_positions(exchange):
+    """
+    پوزیشن‌های باز را از صرافی دریافت می‌کند.
+    اگر صرافی در حال تسویه فاندینگ باشد، تا زمان در دسترس شدن، منتظر می‌ماند و دوباره تلاش می‌کند.
+    """
+    while True: # حلقه تکرار هوشمند
+        try:
+            log("۱. در حال دریافت پوزیشن‌های باز از صرافی...")
+            params = {'type': 'swap'}
+            all_positions = exchange.fetch_positions(None, params)
+            
+            open_positions = {p['symbol']: p for p in all_positions if float(p.get('contracts', 0)) > 0}
+            
+            if open_positions:
+                log(f"   -> {len(open_positions)} پوزیشن باز پیدا شد: {list(open_positions.keys())}")
+            else:
+                log("   -> هیچ پوزیشن بازی در صرافی وجود ندارد.")
+                
+            return open_positions # <-- اگر موفق بود، از حلقه خارج شو و نتیجه را برگردان
+
+        except ccxt.BaseError as e:
+            # بررسی هوشمندانه متن خطا
+            if 'funding fee settlement' in str(e):
+                log(f"🟡 هشدار صرافی: سرویس در حین تسویه کارمزد فاندینگ در دسترس نیست.")
+                log(f"   -> ربات متوقف نمی‌شود. {RETRY_INTERVAL_SECONDS} ثانیه دیگر دوباره تلاش خواهد شد...")
+                time.sleep(RETRY_INTERVAL_SECONDS)
+                # حلقه ادامه پیدا می‌کند و دوباره تلاش می‌کند
+            else:
+                # اگر خطا مربوط به فاندینگ نبود، یک خطای جدی است
+                log(f"❌ خطای جدی در ارتباط با صرافی: {e}")
+                send_message(f"<b>❌ خطای جدی در دریافت پوزیشن</b>\n\n<b>خطا:</b>\n<code>{e}</code>")
+                return None # <-- برای خطاهای دیگر، از حلقه خارج شو و خطا را برگردان
+        except Exception as e:
+            log(f"❌ یک خطای پیش‌بینی نشده در دریافت پوزیشن رخ داد: {e}")
+            return None
+
 
 def get_new_signal(conn):
     """یک سیگنال جدید از دیتابیس MySQL دریافت می‌کند."""
-    cursor = conn.cursor(dictionary=True) # dictionary=True برای دسترسی به ستون‌ها با نام
+    cursor = conn.cursor(dictionary=True)
     query = "SELECT symbol, side, price, timestamp, signal_id FROM signals WHERE status = 'new' ORDER BY updated_at ASC LIMIT 1"
     cursor.execute(query)
     signal = cursor.fetchone()
@@ -36,15 +74,13 @@ def process_trades(exchange):
     conn = None
     try:
         log("--- شروع چرخه جدید تريد ---")
-        # ۱. دریافت پوزیشن‌های فعال از صرافی
-        log("۱. در حال دریافت پوزیشن‌های باز از صرافی...")
-        params = {'type': 'swap'}
-        all_positions = exchange.fetch_positions(None, params)
-        open_positions = {p['symbol']: p for p in all_positions if float(p.get('contracts', 0)) > 0}
-        if open_positions:
-            log(f"   -> {len(open_positions)} پوزیشن باز پیدا شد: {list(open_positions.keys())}")
-        else:
-            log("   -> هیچ پوزیشن بازی در صرافی وجود ندارد.")
+        # ۱. دریافت پوزیشن‌های فعال (با منطق جدید)
+        open_positions = get_active_positions(exchange)
+        
+        # اگر get_active_positions یک خطای جدی برگرداند، این چرخه را رد کن
+        if open_positions is None:
+            log("   -> پردازش این چرخه به دلیل خطای جدی در دریافت پوزیشن متوقف شد.")
+            return
 
         # ۲. اتصال به دیتابیس و دریافت سیگنال جدید
         conn = create_db_connection()
@@ -106,10 +142,8 @@ def process_trades(exchange):
                 send_message(f"<b>❌ خطا در باز کردن پوزیشن</b>\n\n<b>نماد:</b> {symbol}\n<b>خطا:</b>\n<code>{e}</code>")
                 update_signal_status(conn, symbol, 'processed_error')
 
-    except ccxt.BaseError as e:
-        log(f"❌ خطای ارتباط با صرافی. خطا: {e}")
     except Exception as e:
-        log(f"❌ یک خطای پیش‌بینی نشده در Trader رخ داد. خطا: {e}")
+        log(f"❌ یک خطای پیش‌بینی نشده در چرخه اصلی Trader رخ داد. خطا: {e}")
     finally:
         if conn and conn.is_connected():
             conn.close()
