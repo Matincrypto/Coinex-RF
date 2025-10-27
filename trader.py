@@ -178,4 +178,129 @@ def main():
                             close_side = 'sell' if existing_position['side'] == 'buy' else 'buy'
                             # استفاده از Market Order برای بستن فوری و تضمینی پوزیشن
                             # reduceOnly=True تضمین می‌کند که فقط پوزیشن فعلی بسته شود و پوزیشن جدید باز نشود
-                            params_close = {'reduceOnly': True, 'market_
+                            
+                            # --- (خطای شما اینجا بود - تصحیح شد) ---
+                            params_close = {'reduceOnly': True, 'market_type': 'FUTURES'} 
+                            # -------------------------------------
+
+                            log(f"   -> Placing MARKET order to close {symbol}...")
+                            
+                            closing_order = exchange.create_order(symbol, 'market', close_side, existing_position['contracts'], None, params_close)
+                            
+                            log(f"   ✅ Closing order placed. ID: {closing_order['id']}")
+                            send_message(f"<b>⏳ Position Closing (Reversing)</b>\n\n"
+                                         f"<b>Symbol:</b> {symbol}\n<b>Side:</b> {existing_position['side'].upper()}\n"
+                                         f"<b>Amount:</b> {existing_position['contracts']}\n<b>Type:</b> MARKET")
+                            
+                            update_signal_status(conn, symbol, 'processed_closed_old')
+                            time.sleep(3) # تاخیر کوتاه برای پردازش سفارش توسط صرافی
+                            continue # برو به ابتدای حلقه و پوزیشن جدید باز نکن
+
+                        except Exception as e:
+                            log(f"   ❌ CRITICAL: Failed to close reverse position for {symbol}. Error: {e}")
+                            update_signal_status(conn, symbol, 'processed_error')
+                            send_message(f"<b>❌ CRITICAL: Failed to Close Position</b>\n\n"
+                                         f"<b>Symbol:</b> {symbol}\n<b>Error:</b>\n<code>{e}</code>")
+                            continue # در صورت خطا، حتما ادامه بده و پوزیشن جدید باز نکن
+                        # ----------------------------------------------------
+                            
+                    else:
+                        log(f"-> Signal has same side as active position for {symbol}. Skipping.")
+                        update_signal_status(conn, symbol, 'processed_duplicate')
+                        continue
+
+                # --- (اصلاحیه ۳) بخش کامل باز کردن موقعیت جدید ---
+                log(f"-> Proceeding to open new {order_side.upper()} position for {symbol}.")
+                try:
+                    # ۱. دریافت اطلاعات بازار که در ابتدا لود کردیم
+                    market_info = exchange.markets.get(symbol)
+                    if not market_info:
+                        log(f"   ❌ ERROR: No market data found for {symbol} (was not loaded). Skipping.")
+                        update_signal_status(conn, symbol, 'processed_error')
+                        continue
+                        
+                    # ۲. محاسبه دینامیک بافر کارمزد
+                    taker_fee_rate = float(market_info['taker'])
+                    FEE_BUFFER = taker_fee_rate + 0.0005  # e.g., 0.002 (0.2%) + 0.0005 (0.05%) = 0.0025 (0.25%)
+                    adjusted_usdt_amount = config.USDT_AMOUNT * (1 - FEE_BUFFER)
+
+                    # ۳. تنظیم اهرم (Leverage)
+                    log(f"-> Setting leverage for {symbol} to {config.LEVERAGE}x...")
+                    params_open = {'market_type': 'FUTURES'} 
+                    try:
+                        exchange.set_leverage(config.LEVERAGE, symbol, params_open)
+                        log(f"   ✅ Leverage set successfully to {config.LEVERAGE}x.")
+                    except Exception as e:
+                        log(f"   ❌ WARNING: Failed to set leverage for {symbol}. Error: {e}")
+                        send_message(f"<b>⚠️ Warning: Failed to Set Leverage</b>\n\n<b>Symbol:</b> {symbol}\n<b>Error:</b>\n<code>{e}</code>")
+                        update_signal_status(conn, symbol, 'processed_error')
+                        continue # اگر تنظیم اهرم شکست خورد، ادامه نده
+
+                    # ۴. محاسبه مقدار (Amount)
+                    total_position_value = adjusted_usdt_amount * config.LEVERAGE
+                    raw_amount_to_trade = total_position_value / price # مقدار خام
+                    
+                    # ۵. اعمال دقت اعشار و قیمت (Formatting)
+                    amount_to_trade_str = exchange.amount_to_precision(symbol, raw_amount_to_trade)
+                    price_to_trade_str = exchange.price_to_precision(symbol, price)
+                    
+                    amount_to_trade_float = float(amount_to_trade_str)
+                    price_to_trade_float = float(price_to_trade_str)
+
+
+                    # ۶. بررسی حداقل مقدار سفارش (Min Amount Check)
+                    min_amount = float(market_info['limits']['amount']['min'])
+                    if amount_to_trade_float < min_amount:
+                        log(f"   ❌ ERROR: Calculated amount {amount_to_trade_float} is less than min_amount {min_amount} for {symbol}. Skipping.")
+                        send_message(f"<b>❌ Order Error: Amount Too Small</b>\n\n<b>Symbol:</b> {symbol}\n<b>Calculated:</b> {amount_to_trade_float}\n<b>Min:</b> {min_amount}")
+                        update_signal_status(conn, symbol, 'processed_error')
+                        continue
+
+                    # --- لاگ نهایی قبل از ارسال ---
+                    log(f"   -> Adjusted Margin: ${adjusted_usdt_amount:.2f} (Fee Buffer: {FEE_BUFFER*100:.3f}%)")
+                    log(f"   -> Target Position Value: ${total_position_value:.2f}")
+                    log(f"   -> Raw Amount: {raw_amount_to_trade} -> Formatted Amount: {amount_to_trade_str}")
+                    log(f"   -> Raw Price: {price} -> Formatted Price: {price_to_trade_str}")
+
+                    # ۷. ثبت سفارش نهایی
+                    new_order = exchange.create_order(symbol, 'limit', order_side, amount_to_trade_float, price_to_trade_float, params_open)
+                    
+                    log(f"✅ New position opened successfully! ID: {new_order['id']}")
+
+                    send_message(f"<b>{'📈' if order_side == 'buy' else '📉'} New Position Opened ({order_side.upper()})</b>\n\n"
+                                 f"<b>Symbol:</b> {symbol}\n<b>Price:</b> {price_to_trade_str}\n"
+                                 f"<b>Amount:</b> {amount_to_trade_str}\n<b>Value:</b> ${total_position_value:.2f}")
+                    
+                    update_signal_status(conn, symbol, 'processed')
+                
+                except Exception as e:
+                    log(f"❌ CRITICAL: Failed to open new position for {symbol}. Error: {e}")
+                    update_signal_status(conn, symbol, 'processed_error')
+                    send_message(f"<b>❌ CRITICAL: Failed to Open Position</b>\n\n"
+                                 f"<b>Symbol:</b> {symbol}\n<b>Error:</b>\n<code>{e}</code>")
+                # ----------------------------------------------------
+
+        except mysql.connector.Error as e:
+            log(f"❌ DATABASE ERROR in main loop: {e}")
+            send_message(f"<b>❌ Database Error (Trader Loop)</b>\n\n<b>Error:</b>\n<code>{e}</code>")
+        except ccxt.BaseError as e:
+            log(f"❌ EXCHANGE ERROR in main loop: {e}")
+            send_message(f"<b>⚠️ Exchange Warning</b>\n\nAn error occurred with CoinEx.\n\n<b>Error:</b>\n<code>{e}</code>")
+        except KeyboardInterrupt:
+            log("🛑 User interrupted the process. Shutting down.")
+            send_message("<b>🛑 Trader Bot Stopped Manually</b>")
+            break
+        except Exception as e:
+            log(f"❌ An unexpected critical error occurred in the main loop: {e}")
+            send_message(f"<b>❌ CRITICAL ERROR (Trader Loop)</b>\n\nBot will be stopped.\n\n<b>Error:</b>\n<code>{e}</code>")
+            break # در خطاهای ناشناخته بهتر است ربات متوقف شود
+        finally:
+            if conn and conn.is_connected():
+                conn.close()
+                # لاگ بسته شدن دیتابیس را حذف می‌کنیم تا کنسول خلوت بماند
+            
+            log(f"--- Cycle finished. Waiting for {POLL_INTERVAL} seconds... ---")
+            time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    main()
