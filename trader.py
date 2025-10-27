@@ -1,58 +1,49 @@
-# trader.py (نسخه جدید با گزارش وضعیت دوره‌ای و تکرار هوشمند)
+# trader.py (نسخه نهایی با MySQL، تنظیم اهرم، و محاسبه کارمزد دینامیک)
 
 import ccxt
+import mysql.connector
 import time
-from datetime import datetime, timezone, timedelta # ماژول timedelta اضافه شد
-import config
+from datetime import datetime, timezone
+import config  # ایمپورت کردن فایل تنظیمات
 from telegram_logger import send_message
-from shared_utils import log, create_db_connection, setup_database
 
-# --- تنظیمات عمومی ---
-MAX_SIGNAL_AGE_MINUTES = 5
-RETRY_INTERVAL_SECONDS = 30 # فاصله زمانی برای تلاش مجدد هنگام تسویه فاندینگ
+# --- Global Variables ---
+# این متغیرها اکنون از config.py خوانده می‌شوند یا مستقیماً استفاده می‌شوند
+POLL_INTERVAL = config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10  # فاصله زمانی بین هر بررسی (ثانیه)
+MAX_SIGNAL_AGE_MINUTES = 5  # حداکثر عمر سیگنال به دقیقه
 
-# --- تنظیمات جدید برای گزارش وضعیت دوره‌ای ---
-HEALTH_CHECK_INTERVAL_MINUTES = 10 # هر چند دقیقه گزارش ارسال شود
-last_health_check_time = datetime.now(timezone.utc) # زمان آخرین گزارش
+# --- Helper Function for Console Logging ---
+def log(message):
+    """یک پیام را با فرمت زمانی استاندارد UTC چاپ می‌کند."""
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp} UTC] {message}")
 
-def get_active_positions(exchange):
-    """
-    پوزیشن‌های باز را از صرافی دریافت می‌کند.
-    اگر صرافی در حال تسویه فاندینگ باشد، تا زمان در دسترس شدن، منتظر می‌ماند و دوباره تلاش می‌کند.
-    """
-    while True:
-        try:
-            log("۱. در حال دریافت پوزیشن‌های باز از صرافی...")
-            params = {'type': 'swap'}
-            all_positions = exchange.fetch_positions(None, params)
-            open_positions = {p['symbol']: p for p in all_positions if float(p.get('contracts', 0)) > 0}
-            if open_positions:
-                log(f"   -> {len(open_positions)} پوزیشن باز پیدا شد: {list(open_positions.keys())}")
-            else:
-                log("   -> هیچ پوزیشن بازی در صرافی وجود ندارد.")
-            return open_positions
-        except ccxt.BaseError as e:
-            if 'funding fee settlement' in str(e):
-                log(f"🟡 هشدار صرافی: سرویس در حین تسویه کارمزد فاندینگ در دسترس نیست.")
-                log(f"   -> ربات متوقف نمی‌شود. {RETRY_INTERVAL_SECONDS} ثانیه دیگر دوباره تلاش خواهد شد...")
-                time.sleep(RETRY_INTERVAL_SECONDS)
-            else:
-                log(f"❌ خطای جدی در ارتباط با صرافی: {e}")
-                send_message(f"<b>❌ خطای جدی در دریافت پوزیشن</b>\n\n<b>خطا:</b>\n<code>{e}</code>")
-                return None
-        except Exception as e:
-            log(f"❌ یک خطای پیش‌بینی نشده در دریافت پوزیشن رخ داد: {e}")
-            return None
+# --- Database Functions (MySQL Version) ---
+
+def create_db_connection():
+    """یک اتصال جدید به دیتابیس MySQL ایجاد می‌کند و آن را برمی‌گرداند."""
+    try:
+        conn = mysql.connector.connect(
+            host=config.DB_HOST,
+            user=config.DB_USER,
+            password=config.DB_PASSWORD,
+            database=config.DB_NAME,
+            port=config.DB_PORT
+        )
+        if conn.is_connected():
+            # لاگ اتصال موفق را فقط در تابع main نگه می‌داریم تا کنسول شلوغ نشود
+            return conn
+    except mysql.connector.Error as e:
+        log(f"❌ DATABASE CRITICAL: Could not connect to MySQL. Error: {e}")
+        send_message(f"<b>❌ CRITICAL: MySQL Connection Failed</b>\n\n<b>Error:</b>\n<code>{e}</code>")
+        return None
 
 def get_new_signal(conn):
     """یک سیگنال جدید از دیتابیس MySQL دریافت می‌کند."""
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor()
     query = "SELECT symbol, side, price, timestamp, signal_id FROM signals WHERE status = 'new' ORDER BY updated_at ASC LIMIT 1"
     cursor.execute(query)
-    signal = cursor.fetchone()
-    if signal:
-        log(f"🔥 سیگنال جدید پیدا شد: {signal['symbol']} | {signal['side']} | شناسه: {signal['signal_id']}")
-    return signal
+    return cursor.fetchone()
 
 def update_signal_status(conn, symbol, new_status):
     """وضعیت یک سیگنال را در دیتابیس MySQL به‌روزرسانی می‌کند."""
@@ -61,109 +52,130 @@ def update_signal_status(conn, symbol, new_status):
         query = "UPDATE signals SET status = %s WHERE symbol = %s"
         cursor.execute(query, (new_status, symbol))
         conn.commit()
-        log(f"   -> وضعیت سیگنال {symbol} در دیتابیس به '{new_status}' تغییر کرد.")
-    except Exception as e:
-        log(f"   -> ❌ خطا در آپدیت وضعیت سیگنال {symbol}. خطا: {e}")
+        log(f"   -> DB: Updated status for {symbol} to '{new_status}'.")
+    except mysql.connector.Error as e:
+        log(f"   -> ❌ DB ERROR: Failed to update status for {symbol}. Error: {e}")
         conn.rollback()
 
-def process_trades(exchange):
-    """منطق اصلی پردازش معاملات را اجرا می‌کند."""
-    conn = None
+# --- Exchange Functions ---
+
+def get_active_positions(exchange):
+    """موقعیت‌های باز فعلی را از صرافی دریافت می‌کند."""
     try:
-        log("--- شروع چرخه جدید تريد ---")
-        open_positions = get_active_positions(exchange)
-        if open_positions is None:
-            log("   -> پردازش این چرخه به دلیل خطای جدی در دریافت پوزیشن متوقف شد.")
-            return
-
-        conn = create_db_connection()
-        if not conn:
-            log("پردازش به دلیل عدم اتصال به دیتابیس متوقف شد.")
-            return
-
-        signal = get_new_signal(conn)
-        if not signal:
-            log("۲. سیگنال جدیدی برای پردازش در دیتابیس وجود ندارد.")
-            return
+        log("-> Fetching open positions from CoinEx (Swap)...")
+        params = {'type': 'swap'}
+        all_positions = exchange.fetch_positions(None, params)
         
-        log(f"۲. در حال پردازش سیگنال برای نماد {signal['symbol']}...")
-
-        signal_age = datetime.now(timezone.utc) - datetime.fromtimestamp(signal['timestamp'], tz=timezone.utc)
-        if signal_age.total_seconds() > (MAX_SIGNAL_AGE_MINUTES * 60):
-            log(f"🟡 سیگنال نادیده گرفته شد (سوخته). عمر سیگنال: {signal_age}")
-            update_signal_status(conn, signal['symbol'], 'processed_burnt')
-            return
-
-        symbol, order_side, price = signal['symbol'], signal['side'].lower(), signal['price']
+        open_positions = [p for p in all_positions if float(p.get('contracts', p.get('size', 0))) > 0]
         
-        if symbol in open_positions:
-            existing_pos = open_positions[symbol]
-            log(f"   -> یک پوزیشن '{existing_pos['side'].upper()}' برای {symbol} از قبل باز است.")
-            if existing_pos['side'] != order_side:
-                log(f"   -> سیگنال معکوس شناسایی شد! در حال بستن پوزیشن فعلی...")
-                # ... (بقیه کد بدون تغییر)
-            else:
-                log("   -> سیگنال هم‌جهت با پوزیشن فعلی است. نادیده گرفته شد.")
-                update_signal_status(conn, signal, 'processed_duplicate')
+        active_positions = {
+            pos['symbol']: {
+                'side': pos['side'],
+                'contracts': float(pos.get('contracts', pos.get('size', 0))),
+                'entryPrice': float(pos['entryPrice'])
+            } for pos in open_positions
+        }
+        
+        if active_positions:
+            log(f"-> Found {len(active_positions)} open position(s): {list(active_positions.keys())}")
         else:
-            log("   -> پوزیشن بازی برای این نماد وجود ندارد. در حال باز کردن پوزیشن جدید...")
-            # ... (بقیه کد بدون تغییر)
-
+            log("-> No open positions found.")
+            
+        return active_positions
     except Exception as e:
-        log(f"❌ یک خطای پیش‌بینی نشده در چرخه اصلی Trader رخ داد. خطا: {e}")
-    finally:
-        if conn and conn.is_connected():
-            conn.close()
-            log("اتصال به دیتابیس بسته شد.")
+        log(f"❌ EXCHANGE ERROR: Could not fetch positions: {e}")
+        send_message(f"<b>⚠️ Warning: Could not fetch positions</b>\n\n<b>Error:</b>\n<code>{e}</code>")
+        return None
 
-def send_health_check():
-    """یک پیام وضعیت برای اطمینان از فعال بودن ربات به تلگرام ارسال می‌کند."""
-    global last_health_check_time
-    now = datetime.now(timezone.utc)
-    if now - last_health_check_time > timedelta(minutes=HEALTH_CHECK_INTERVAL_MINUTES):
-        log("✅ ارسال گزارش وضعیت دوره‌ای به تلگرام...")
-        time_str = now.strftime('%Y-%m-%d %H:%M:%S')
-        message = (f"<b>- گزارش وضعیت ربات معامله‌گر -</b>\n\n"
-                   f"✅ ربات فعال و در حال کار است.\n"
-                   f"<b>آخرین بررسی:</b>\n<code>{time_str} UTC</code>")
-        send_message(message)
-        last_health_check_time = now # به‌روزرسانی زمان آخرین گزارش
+# --- Main Bot Logic ---
 
-if __name__ == "__main__":
-    log("🚀 ربات معامله‌گر (Trader) در حال شروع به کار...")
+def main():
+    log("🚀 Initializing CoinEx connection...")
     try:
         exchange = ccxt.coinex({
             'apiKey': config.COINEX_ACCESS_ID,
             'secret': config.COINEX_SECRET_KEY,
             'options': {'defaultType': 'swap'},
         })
-        log("✅ با موفقیت به صرافی CoinEx متصل شد.")
-        send_message(f"<b>✅ Trader Bot Started (Robust Version)</b>\n\n"
-                     f"<b>Margin:</b> ${config.USDT_AMOUNT}\n<b>Leverage:</b> {config.LEVERAGE}x")
         
-        db_conn = create_db_connection()
-        if db_conn:
-            if setup_database(db_conn):
-                db_conn.close()
-                while True:
-                    process_trades(exchange)
-                    
-                    # --- بخش جدید: ارسال گزارش وضعیت ---
-                    send_health_check()
-                    # -----------------------------------
-                    
-                    wait_interval = config.POLL_INTERVAL if hasattr(config, 'POLL_INTERVAL') else 10
-                    log(f"--- چرخه تمام شد. انتظار برای {wait_interval} ثانیه... ---")
-                    time.sleep(wait_interval)
-            else:
-                db_conn.close()
-                log("❌ ربات به دلیل عدم موفقیت در راه‌اندازی دیتابیس، متوقف شد.")
-        else:
-            log("❌ ربات به دلیل عدم اتصال به دیتابیس، متوقف شد.")
-
-    except KeyboardInterrupt:
-        log("🛑 ربات معامله‌گر با دستور کاربر متوقف شد.")
-        send_message("<b>🛑 Trader Bot Stopped Manually</b>")
+        # --- (اصلاحیه ۱) بارگذاری اطلاعات بازار ---
+        log("-> در حال بارگذاری اطلاعات بازار (کارمزد، دقت، ...)")
+        exchange.load_markets() 
+        log("✅ اتصال به CoinEx موفق و اطلاعات بازار بارگذاری شد.")
+        # ----------------------------------------
+        
     except Exception as e:
-        log(f"❌ یک خطای حیاتی در هنگام شروع به کار Trader رخ داد. خطا: {e}")
-        send_message(f"<b>❌ CRITICAL ERROR (Trader Start)</b>\n\n<b>Error:</b>\n<code>{e}</code>")
+        log(f"❌ CRITICAL: Failed to connect or load markets. Shutting down. Error: {e}")
+        send_message(f"<b>❌ CRITICAL ERROR</b>\n\nFailed to connect to CoinEx or load markets.\n\n<b>Error:</b>\n<code>{e}</code>")
+        return
+
+    start_message = (
+        f"<b>✅ Trader Bot Started (MySQL Version)</b>\n\n"
+        f"<b>Margin:</b> ${config.USDT_AMOUNT}\n"
+        f"<b>Leverage:</b> {config.LEVERAGE}x"
+    )
+    send_message(start_message)
+
+    db_conn_main = None
+    try:
+        db_conn_main = create_db_connection()
+        if db_conn_main and db_conn_main.is_connected():
+            log("✅ Successfully connected to MySQL database.")
+        else:
+            log("❌ Database connection failed at start. Exiting.")
+            return
+    finally:
+        if db_conn_main and db_conn_main.is_connected():
+            db_conn_main.close()
+
+
+    while True:
+        conn = None
+        try:
+            # 1. اتصال به دیتابیس
+            conn = create_db_connection()
+            if not conn:
+                log("Database connection failed. Retrying in a moment...")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # 2. دریافت موقعیت‌های فعال از صرافی
+            active_positions = get_active_positions(exchange)
+            if active_positions is None:
+                log("Could not get active positions. Skipping this cycle.")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # 3. دریافت سیگنال جدید از دیتابیس
+            signal = get_new_signal(conn)
+
+            if not signal:
+                log("No new signals to process.")
+            else:
+                symbol, side, price, signal_timestamp, signal_id = signal
+                order_side = side.lower()
+                
+                log(f"🔥 Processing Signal ID: {signal_id} | Symbol: {symbol} | Side: {order_side} | Price: {price}")
+
+                # 4. بررسی تاریخ انقضای سیگنال (سیگنال سوخته)
+                current_utc_time = datetime.now(timezone.utc)
+                signal_utc_time = datetime.fromtimestamp(float(signal_timestamp), tz=timezone.utc)
+                time_difference = current_utc_time - signal_utc_time
+                
+                if time_difference.total_seconds() > (MAX_SIGNAL_AGE_MINUTES * 60):
+                    log(f"🟡 SKIPPING (Burnt Signal): Signal is older than {MAX_SIGNAL_AGE_MINUTES} minutes.")
+                    update_signal_status(conn, symbol, 'processed_burnt')
+                    continue
+                
+                # 5. بررسی منطق معاملاتی بر اساس موقعیت‌های باز
+                if symbol in active_positions:
+                    existing_position = active_positions[symbol]
+                    if existing_position['side'] != order_side:
+                        
+                        # --- (اصلاحیه ۲) منطق امن‌تر برای بستن پوزیشن معکوس ---
+                        log(f"-> Reverse signal detected! Attempting to close existing {existing_position['side'].upper()} position for {symbol}.")
+                        try:
+                            close_side = 'sell' if existing_position['side'] == 'buy' else 'buy'
+                            # استفاده از Market Order برای بستن فوری و تضمینی پوزیشن
+                            # reduceOnly=True تضمین می‌کند که فقط پوزیشن فعلی بسته شود و پوزیشن جدید باز نشود
+                            params_close = {'reduceOnly': True, 'market_
